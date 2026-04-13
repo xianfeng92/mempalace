@@ -378,6 +378,116 @@ def chunk_text(content: str, source_file: str) -> list:
 # =============================================================================
 
 
+_ENTITY_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
+_ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset(), "raw": {}}
+_ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
+_ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
+
+
+def _refresh_known_entities_cache() -> None:
+    """Reload ``~/.mempalace/known_entities.json`` into the module cache if
+    its mtime changed since the last read. Shared by ``_load_known_entities``
+    (flat set) and ``_load_known_entities_raw`` (category dict), so callers
+    can pick whichever shape they need without duplicating the mtime-gated
+    disk read.
+    """
+    try:
+        mtime = os.path.getmtime(_ENTITY_REGISTRY_PATH)
+    except OSError:
+        if _ENTITY_REGISTRY_CACHE["mtime"] is not None:
+            _ENTITY_REGISTRY_CACHE["mtime"] = None
+            _ENTITY_REGISTRY_CACHE["names"] = frozenset()
+            _ENTITY_REGISTRY_CACHE["raw"] = {}
+        return
+
+    if _ENTITY_REGISTRY_CACHE["mtime"] == mtime:
+        return
+
+    names: set = set()
+    raw: dict = {}
+    try:
+        import json
+
+        with open(_ENTITY_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            raw = data
+            for cat in data.values():
+                if isinstance(cat, list):
+                    names.update(str(n) for n in cat if n)
+                elif isinstance(cat, dict):
+                    names.update(str(k) for k in cat.keys() if k)
+    except Exception:
+        names = set()
+        raw = {}
+
+    _ENTITY_REGISTRY_CACHE["mtime"] = mtime
+    _ENTITY_REGISTRY_CACHE["names"] = frozenset(names)
+    _ENTITY_REGISTRY_CACHE["raw"] = raw
+
+
+def _load_known_entities() -> frozenset:
+    """Flat set of every known entity name (across all categories).
+
+    Cached by mtime; invalidated when the registry file changes.
+    """
+    _refresh_known_entities_cache()
+    return _ENTITY_REGISTRY_CACHE["names"]
+
+
+def _load_known_entities_raw() -> dict:
+    """Full category-dict view of the registry, shape
+    ``{"category": ["Name1", ...], ...}``. Cached by mtime.
+
+    Consumed by modules (e.g., fact_checker) that need to reason about
+    categories rather than a flat name set. Never returns a mutable
+    reference to the cache — callers get a shallow copy.
+    """
+    _refresh_known_entities_cache()
+    return dict(_ENTITY_REGISTRY_CACHE["raw"])
+
+
+def _extract_entities_for_metadata(content: str) -> str:
+    """Extract entity names from content for metadata tagging.
+
+    Combines the user's known-entity registry (cached across calls) with
+    capitalized words appearing ≥2 times in the first ``_ENTITY_EXTRACT_WINDOW``
+    chars. Filters out the closet stoplist (``When``, ``After``, ``The``, …)
+    so sentence-starters don't masquerade as proper nouns.
+
+    Returns semicolon-separated string suitable for ChromaDB metadata
+    filtering. The list is truncated to ``_ENTITY_METADATA_LIMIT`` entries
+    *before* joining so a name is never cut in half.
+    """
+    import re
+
+    from .palace import _ENTITY_STOPLIST
+
+    matched: set = set()
+
+    known = _load_known_entities()
+    for name in known:
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
+            matched.add(name)
+
+    window = content[:_ENTITY_EXTRACT_WINDOW]
+    words = re.findall(r"\b[A-Z][a-z]{2,}\b", window)
+    freq: dict = {}
+    for w in words:
+        if w in _ENTITY_STOPLIST:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+    for w, c in freq.items():
+        if c >= 2 and len(w) > 2:
+            matched.add(w)
+
+    if not matched:
+        return ""
+    # Truncate the *list*, not the joined string — never split a name.
+    capped = sorted(matched)[:_ENTITY_METADATA_LIMIT]
+    return ";".join(capped)
+
+
 def add_drawer(
     collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
 ):
@@ -398,6 +508,10 @@ def add_drawer(
             metadata["source_mtime"] = os.path.getmtime(source_file)
         except OSError:
             pass
+        # Tag with entity names for filterable search
+        entities = _extract_entities_for_metadata(content)
+        if entities:
+            metadata["entities"] = entities
         collection.upsert(
             documents=[content],
             ids=[drawer_id],
@@ -490,20 +604,19 @@ def process_file(
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
+            entities = _extract_entities_for_metadata(content)
+            closet_meta = {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "drawer_count": drawers_added,
+                "filed_at": datetime.now().isoformat(),
+                "normalize_version": NORMALIZE_VERSION,
+            }
+            if entities:
+                closet_meta["entities"] = entities
             purge_file_closets(closets_col, source_file)
-            upsert_closet_lines(
-                closets_col,
-                closet_id_base,
-                closet_lines,
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file,
-                    "drawer_count": drawers_added,
-                    "filed_at": datetime.now().isoformat(),
-                    "normalize_version": NORMALIZE_VERSION,
-                },
-            )
+            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room
 
